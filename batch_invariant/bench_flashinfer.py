@@ -409,7 +409,7 @@ bench_mixed.setUp()
 
 SEQ_LENS = [1024, 2048, 4096, 8192]
 BATCH_SIZES = [1, 2, 4, 16, 64, 128, 256]
-SPLIT_TILES = [2048, 4096, 8192]
+SPLIT_TILES = [1024, 2048, 4096, 8192]
 
 pref_non_det = {}
 pref_det = {}
@@ -428,7 +428,7 @@ for seq_len in SEQ_LENS:
 
 for seq_len in SEQ_LENS:
     print(f"Extend seq_len={seq_len}: Non-deterministic time = {pref_non_det[seq_len]:.4f}s, "
-          f"{' '.join([f'Split {split} time = {pref_det[seq_len][split]:.4f}s' for split in SPLIT_TILES])}"
+          f"{' '.join([f'Deterministic (split size {split}) time = {pref_det[seq_len][split]:.4f}s' for split in SPLIT_TILES])}"
           )
 
 '''
