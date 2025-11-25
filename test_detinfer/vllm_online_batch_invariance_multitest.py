@@ -5,7 +5,7 @@ HTTP-based batch invariance test across multiple batch sizes and max_tokens.
 Tests BS=1 vs BS=N for various N and token lengths.
 
 Environment variables:
-  - SGLANG_TEST_MODEL: served model name (e.g., Qwen/Qwen3-1.7B / DeepSeek-R1)
+  - SGLANG_TEST_MODEL: served model name (e.g., meta-llama/Meta-Llama-3.1-8B-Instruct)
   - SGLANG_TP_SIZE: tensor parallelism size (e.g., 4)
   - SGLANG_HOST: server host (default: 127.0.0.1)
   - SGLANG_PORT: server port (default: 30000)
