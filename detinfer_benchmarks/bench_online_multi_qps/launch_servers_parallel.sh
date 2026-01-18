@@ -11,8 +11,8 @@ MODEL_PATH="${SGLANG_TEST_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
 HOST="${SGLANG_HOST:-0.0.0.0}"
 BASE_PORT="${SGLANG_BASE_PORT:-30005}"
 TP_SIZE="${SGLANG_TP_SIZE:-1}"
-ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-flashinfer}"
-LOG_DIR="${LOG_DIR:-./server_logs_3_di_4gpus}"
+ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-fa3}"
+LOG_DIR="${LOG_DIR:-./server_logs_${ATTENTION_BACKEND}_TP${TP_SIZE}}"
 
 # Determine Python command
 if command -v python &> /dev/null; then
