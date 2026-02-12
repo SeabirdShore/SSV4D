@@ -6,11 +6,11 @@
 set -e
 
 # Model and server configuration
-MODEL_PATH="${SGLANG_TEST_MODEL:-Qwen/Qwen3-30B-A3B}"
+MODEL_PATH="${SGLANG_TEST_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
 HOST="${SGLANG_HOST:-0.0.0.0}"
 PORT="${SGLANG_PORT:-30005}"
-TP_SIZE="${SGLANG_TP_SIZE:-4}"
-ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-flashinfer}"
+TP_SIZE="${SGLANG_TP_SIZE:-1}"
+ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-fa3}"
 
 # Determine Python command
 if command -v python &> /dev/null; then
@@ -45,13 +45,17 @@ $PYTHON_CMD -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --disable-overlap-schedule \
     --enable-metrics \
-    --det-infer-window-size 64 \
-    --enable-det-infer 3 \
-    --det-infer-verify-batch-size 1
+    --llm-42-window-size 128 \
+    --enable-llm-42 3 \
+    --llm-42-verify-batch-size 1
+    # Mode values for --enable-llm-42:
+    # 1 = bi_kernel + vllm_rmsnorm (batch-invariant during verification)
+    # 2 = batch_invariant + native_rmsnorm (batch-invariant during verification)
+    # 3 = non-batch-invariant (default CUDA kernels during verification)
     # --enable-selective-determinism 1 \
-    # --enable-deterministic-inference 2 \
-    # --det-infer-window-size 10 \
-    # --enable-det-infer 1
+    # --enable-deterministic-inference 1 \
+    # --llm-42-window-size 10 \
+    # --enable-llm-42 1
     # --enable-selective-determinism 1 \
     # --enable-deterministic-inference 1 \
     # --disable-cuda-graph \

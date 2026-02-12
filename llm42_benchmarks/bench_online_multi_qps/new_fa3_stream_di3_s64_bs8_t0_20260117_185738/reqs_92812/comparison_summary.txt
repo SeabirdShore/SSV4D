@@ -2,7 +2,7 @@
 Multi-Config Comparison Summary (from existing files)
 ================================================================================
 
-Input Directory: /home/t-gondraja/batch_inv/fa-llm42/detinfer_benchmarks/bench_online_multi_qps/new_fa3_stream_di3_s64_bs8_t0_20260117_185738/reqs_92812
+Input Directory: /home/t-gondraja/batch_inv/fa-llm42/llm42_benchmarks/bench_online_multi_qps/new_fa3_stream_di3_s64_bs8_t0_20260117_185738/reqs_92812
 Configs: ['qps4.0_o132_a16', 'qps4.5_o133_a17', 'qps5.0_o134_a18', 'qps5.5_o135_a19', 'qps6.0_o136_a20', 'qps6.5_o137_a21', 'qps7.0_o138_a22', 'qps7.5_o139_a23']
 
 --------------------------------------------------------------------------------

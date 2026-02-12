@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.detinfer.det_verify_info import DetVerifyInfo
+from sglang.srt.llm42.det_verify_info import DetVerifyInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatchOutput, ForwardMode
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ class FixedSizeVerificationPool:
     """
     Pre-allocated pool of dummy resources for fixed-size verification batches.
     
-    When det_infer_verify_batch_size is set, verification batches always have exactly
+    When llm_42_verify_batch_size is set, verification batches always have exactly
     N requests. This pool provides pre-allocated dummy resources to fill slots
     when there are fewer than N real requests.
     """
@@ -86,7 +86,7 @@ class FixedSizeVerificationPool:
         if self.dummy_cache_locs is None or len(self.dummy_cache_locs) == 0:
             raise RuntimeError(
                 f"Failed to allocate {slots_needed} KV cache slots for fixed-size verification pool. "
-                f"Consider reducing det_infer_verify_batch_size or increasing KV cache size."
+                f"Consider reducing llm_42_verify_batch_size or increasing KV cache size."
             )
         
         # CRITICAL FIX: Allocate actual row indices in req_to_token_pool for dummy requests
@@ -96,7 +96,7 @@ class FixedSizeVerificationPool:
         if allocated_pool_indices is None or len(allocated_pool_indices) < fixed_size:
             raise RuntimeError(
                 f"Failed to allocate {fixed_size} req_to_token_pool slots for dummy requests. "
-                f"Consider reducing det_infer_verify_batch_size or increasing pool size."
+                f"Consider reducing llm_42_verify_batch_size or increasing pool size."
             )
         
         self.dummy_req_pool_indices = torch.tensor(
@@ -342,7 +342,7 @@ class DeterministicVerificationWorker:
         This is called from process_batch_result_decode, similar to how Eagle
         handles verification after output processing.
         
-        When fixed_pool is enabled (det_infer_verify_batch_size is set with allocators),
+        When fixed_pool is enabled (llm_42_verify_batch_size is set with allocators),
         verification runs with exactly N requests by:
         1. Including all deterministic requests (ready or not, padding partial outputs)
         2. Filling remaining slots with pre-allocated dummy requests
@@ -367,7 +367,7 @@ class DeterministicVerificationWorker:
             
             # Calculate unverified tokens
             output_len = len(req.output_ids)
-            unverified_tokens = output_len - req.det_infer_verified_tokens
+            unverified_tokens = output_len - req.llm_42_verified_tokens
             
             if unverified_tokens <= 0:
                 continue
@@ -391,7 +391,7 @@ class DeterministicVerificationWorker:
             not_ready_reqs = []
             for req in all_det_reqs:
                 output_len = len(req.output_ids)
-                unverified_tokens = output_len - req.det_infer_verified_tokens
+                unverified_tokens = output_len - req.llm_42_verified_tokens
                 is_finished = req.finished_reason is not None
                 if is_finished or unverified_tokens >= self._window_size:
                     ready_reqs.append(req)
@@ -430,7 +430,7 @@ class DeterministicVerificationWorker:
         reqs_to_verify = []
         for req in all_det_reqs:
             output_len = len(req.output_ids)
-            unverified_tokens = output_len - req.det_infer_verified_tokens
+            unverified_tokens = output_len - req.llm_42_verified_tokens
             is_finished = req.finished_reason is not None
             if is_finished or unverified_tokens >= self._window_size:
                 reqs_to_verify.append(req)
@@ -508,7 +508,7 @@ class DeterministicVerificationWorker:
                     real_reqs, verified_token_ids, verified_logprobs
                 )
             elif self.skip_mismatch <= 0.0:
-                rollback_info = [(len(req.output_ids) - req.det_infer_verified_tokens, 0) for req in real_reqs]
+                rollback_info = [(len(req.output_ids) - req.llm_42_verified_tokens, 0) for req in real_reqs]
             else:
                 rollback_info = det_verify_info.verify_and_compare(
                     real_reqs, verified_token_ids, verified_logprobs,
@@ -519,17 +519,17 @@ class DeterministicVerificationWorker:
             rollback_results = []
             for req, info in zip(real_reqs, rollback_info):
                 # Increment verification window count for this request
-                req.det_infer_num_verification_windows += 1
+                req.llm_42_num_verification_windows += 1
                 if info is not None and info[1] > 0:
-                    req.det_infer_num_rollbacks += 1
-                    req.det_infer_tokens_rolled_back += info[1]
+                    req.llm_42_num_rollbacks += 1
+                    req.llm_42_tokens_rolled_back += info[1]
                     if self.metrics_collector:
                         self.metrics_collector.num_rollbacks_total.labels(**self.metrics_collector.labels).inc()
                         self.metrics_collector.tokens_rolled_back_total.labels(**self.metrics_collector.labels).inc(info[1])
                     rollback_results.append((req, info[1]))
-                    req.det_infer_verified_tokens = len(req.output_ids)
+                    req.llm_42_verified_tokens = len(req.output_ids)
                 else:
-                    req.det_infer_verified_tokens = len(req.output_ids)
+                    req.llm_42_verified_tokens = len(req.output_ids)
             
             # Update batch state if there was rollback
             if rollback_results:
@@ -671,7 +671,7 @@ class DeterministicVerificationWorker:
                 )
             elif self.skip_mismatch <= 0.0:
                 # Force no mismatches - skip all rollbacks
-                rollback_info = [(len(req.output_ids) - req.det_infer_verified_tokens, 0) for req in reqs]
+                rollback_info = [(len(req.output_ids) - req.llm_42_verified_tokens, 0) for req in reqs]
             else:
                 # Percentage-based: inject mismatch at position (window - ceil(X% * window))
                 rollback_info = det_verify_info.verify_and_compare(
@@ -683,33 +683,33 @@ class DeterministicVerificationWorker:
             rollback_results = []
             for req, info in zip(reqs, rollback_info):
                 # Increment verification window count for this request
-                req.det_infer_num_verification_windows += 1
+                req.llm_42_num_verification_windows += 1
                 if info is not None and info[1] > 0:
                     # Track per-request stats
-                    req.det_infer_num_rollbacks += 1
-                    req.det_infer_tokens_rolled_back += info[1]
+                    req.llm_42_num_rollbacks += 1
+                    req.llm_42_tokens_rolled_back += info[1]
                     # Track global metrics
                     if self.metrics_collector:
                         self.metrics_collector.num_rollbacks_total.labels(**self.metrics_collector.labels).inc()
                         self.metrics_collector.tokens_rolled_back_total.labels(**self.metrics_collector.labels).inc(info[1])
                     rollback_results.append((req, info[1]))
-                    # CRITICAL: Update det_infer_verified_tokens after rollback
+                    # CRITICAL: Update llm_42_verified_tokens after rollback
                     # After rollback, output_ids has been truncated and corrected token appended
                     # All tokens up to current length are now verified
-                    req.det_infer_verified_tokens = len(req.output_ids)
+                    req.llm_42_verified_tokens = len(req.output_ids)
                     # logger.info(f"[DetVerifyWorker] Rollback for req {req.rid[:8]}: "
                     #            f"mismatch_pos={info[0]}, tokens_rolled_back={info[1]}, "
-                    #            f"new_output_len={len(req.output_ids)}, det_infer_verified_tokens={req.det_infer_verified_tokens}, "
+                    #            f"new_output_len={len(req.output_ids)}, llm_42_verified_tokens={req.llm_42_verified_tokens}, "
                     #            f"finished={req.finished_reason is not None}")
                 else:
                     # No rollback for this request
-                    req.det_infer_verified_tokens = len(req.output_ids)
+                    req.llm_42_verified_tokens = len(req.output_ids)
                     # logger.debug(f"[DetVerifyWorker] No rollback for req {req.rid[:8]}: "
-                    #             f"output_len={len(req.output_ids)}, det_infer_verified_tokens={req.det_infer_verified_tokens}")
+                    #             f"output_len={len(req.output_ids)}, llm_42_verified_tokens={req.llm_42_verified_tokens}")
             
             # Update verified token counts
             # for req in reqs:
-            #     req.det_infer_verified_tokens = len(req.output_ids)
+            #     req.llm_42_verified_tokens = len(req.output_ids)
             
             # Update batch state if there was any rollback
             # (need to sync seq_lens with the new req.output_ids length)

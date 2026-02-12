@@ -127,7 +127,7 @@ class DetVerifyInfo:
         padding_counts = []
         
         for req in reqs:
-            unverified_output_ids = req.output_ids[req.det_infer_verified_tokens:]
+            unverified_output_ids = req.output_ids[req.llm_42_verified_tokens:]
             actual_len = len(unverified_output_ids)
             
             # Skip requests with no unverified tokens
@@ -307,7 +307,7 @@ class DetVerifyInfo:
         prefix_lens_list = []
         
         for i, req in enumerate(reqs_to_verify):
-            actual_unverified = req.output_ids[req.det_infer_verified_tokens:]
+            actual_unverified = req.output_ids[req.llm_42_verified_tokens:]
             padded_len = self.padded_lens[i]
             actual_len = self.output_lens[i]
             
@@ -315,8 +315,8 @@ class DetVerifyInfo:
                 continue
             
             # Get the last verified token as context
-            if req.det_infer_verified_tokens > 0:
-                last_verified_token = req.output_ids[req.det_infer_verified_tokens - 1]
+            if req.llm_42_verified_tokens > 0:
+                last_verified_token = req.output_ids[req.llm_42_verified_tokens - 1]
             elif req.origin_input_ids:
                 last_verified_token = req.origin_input_ids[-1]
             elif req.input_ids:
@@ -351,7 +351,7 @@ class DetVerifyInfo:
             
             req_pool_indices.append(req.req_pool_idx)
             output_lens.append(padded_len)
-            prefix_lens_list.append(len(req.origin_input_ids) + req.det_infer_verified_tokens - 1)
+            prefix_lens_list.append(len(req.origin_input_ids) + req.llm_42_verified_tokens - 1)
         
         device = original_batch.device
         verify_batch.input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
@@ -428,7 +428,7 @@ class DetVerifyInfo:
             #   - Total KV positions: origin_input_len + N - 1
             # The last output token (output_ids[N-1]) hasn't had its KV written yet!
             current_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-            context_idx = len(req.origin_input_ids) + req.det_infer_verified_tokens - 1
+            context_idx = len(req.origin_input_ids) + req.llm_42_verified_tokens - 1
             actual_len = self.output_lens[i]
             padded_len = self.padded_lens[i]
             padding_count = self.padding_counts[i]
@@ -459,7 +459,7 @@ class DetVerifyInfo:
             #
             # Note: For actual_len=1, input is [context] + [0 actual tokens] + [window_size-1 dummies]
             
-            start_idx = len(req.origin_input_ids) + req.det_infer_verified_tokens
+            start_idx = len(req.origin_input_ids) + req.llm_42_verified_tokens
             
             # CRITICAL: Always reuse the SAME cache locations that decode wrote to!
             # Verification must overwrite decode KV at the exact same physical slots
@@ -474,7 +474,7 @@ class DetVerifyInfo:
             end_idx = min(start_idx + num_cache_after_context, current_seq_len)
             
             # logger.info(f"[DET_VERIFY] req {req.rid}: origin_input_len={len(req.origin_input_ids)}, "
-            #             f"det_infer_verified_tokens={req.det_infer_verified_tokens}, output_ids_len={len(req.output_ids)}, "
+            #             f"llm_42_verified_tokens={req.llm_42_verified_tokens}, output_ids_len={len(req.output_ids)}, "
             #             f"context_idx={context_idx}, start_idx={start_idx}, end_idx={end_idx}, "
             #             f"current_seq_len={current_seq_len}, padded_len={padded_len}, actual_len={actual_len}")
             

@@ -1,19 +1,22 @@
 #!/bin/bash
 
-# Launch SGLang server(s) for batch invariance testing with dense model
-# Number of servers is calculated as NUM_GPUS / TP_SIZE
+# Launch multiple SGLang servers for parallel batch invariance testing with different step sizes
+# This script starts N servers (one per GPU) with deterministic inference enabled
+# Each server uses a different llm-42-window-size
 
 set -e
 
 # Configuration
 NUM_GPUS="${NUM_GPUS:-4}"
-TP_SIZE="${SGLANG_TP_SIZE:-4}"
-NUM_SERVERS=$((NUM_GPUS / TP_SIZE))  # Calculate servers based on available GPUs and TP size
-MODEL_PATH="${SGLANG_TEST_MODEL:-Qwen/Qwen3-14B}"
+MODEL_PATH="${SGLANG_TEST_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
 HOST="${SGLANG_HOST:-0.0.0.0}"
 BASE_PORT="${SGLANG_BASE_PORT:-30005}"
+TP_SIZE="${SGLANG_TP_SIZE:-1}"
 ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-fa3}"
-LOG_DIR="${LOG_DIR:-./server_logs_dense_tp${TP_SIZE}}"
+LOG_DIR="${LOG_DIR:-./server_logs_multi_step_size}"
+
+# Step sizes for each server (comma-separated)
+STEP_SIZES="${STEP_SIZES:-32,64,128,256}"
 
 # Determine Python command
 if command -v python &> /dev/null; then
@@ -25,20 +28,35 @@ else
     exit 1
 fi
 
+# Convert step sizes to array
+IFS=',' read -ra STEP_SIZE_ARRAY <<< "$STEP_SIZES"
+
+# Validate we have enough GPUs for step sizes
+if [ ${#STEP_SIZE_ARRAY[@]} -gt $NUM_GPUS ]; then
+    echo "Error: More step sizes (${#STEP_SIZE_ARRAY[@]}) than GPUs ($NUM_GPUS)"
+    exit 1
+fi
+
+NUM_SERVERS=${#STEP_SIZE_ARRAY[@]}
+
 # Create log directory
 mkdir -p "$LOG_DIR"
 
 echo "=============================================="
-echo "Starting $NUM_SERVERS SGLang Server(s) (NUM_GPUS=$NUM_GPUS, TP=$TP_SIZE)"
+echo "Starting $NUM_SERVERS SGLang Servers with Different Step Sizes"
 echo "=============================================="
 echo "Model: $MODEL_PATH"
 echo "Host: $HOST"
 echo "Base Port: $BASE_PORT"
-echo "Num GPUs: $NUM_GPUS"
-echo "TP Size: $TP_SIZE"
-echo "Num Servers: $NUM_SERVERS (= $NUM_GPUS / $TP_SIZE)"
+echo "TP Size per server: $TP_SIZE"
 echo "Attention Backend: $ATTENTION_BACKEND"
 echo "Log Directory: $LOG_DIR"
+echo ""
+echo "Step Size Configuration:"
+for ((i=0; i<NUM_SERVERS; i++)); do
+    PORT=$((BASE_PORT + i))
+    echo "  GPU $i (port $PORT): step_size=${STEP_SIZE_ARRAY[$i]}"
+done
 echo "=============================================="
 echo ""
 
@@ -61,21 +79,17 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# Launch server(s)
+# Launch servers with different step sizes
 for ((i=0; i<NUM_SERVERS; i++)); do
     PORT=$((BASE_PORT + i))
-    LOG_FILE="$LOG_DIR/server_${i}_port${PORT}.log"
+    GPU_ID=$i
+    STEP_SIZE=${STEP_SIZE_ARRAY[$i]}
+    LOG_FILE="$LOG_DIR/server_gpu${GPU_ID}_port${PORT}_step${STEP_SIZE}.log"
     
-    # Calculate GPU range for this server (e.g., server 0 gets GPUs 0-3, server 1 gets GPUs 4-7)
-    START_GPU=$((i * TP_SIZE))
-    END_GPU=$((START_GPU + TP_SIZE - 1))
-    GPU_IDS=$(seq -s, $START_GPU $END_GPU)
-    
-    echo "Starting server $i on GPUs $GPU_IDS, port $PORT with TP=$TP_SIZE..."
+    echo "Starting server on GPU $GPU_ID, port $PORT with step_size=$STEP_SIZE..."
     echo "Log file: $LOG_FILE"
     
-    # Assign specific GPUs for this server
-    CUDA_VISIBLE_DEVICES=$GPU_IDS $PYTHON_CMD -m sglang.launch_server \
+    CUDA_VISIBLE_DEVICES=$GPU_ID SGLANG_LOG_LEVEL=DEBUG SGLANG_DEBUG_SAMPLING=1 $PYTHON_CMD -m sglang.launch_server \
         --model-path "$MODEL_PATH" \
         --host "$HOST" \
         --port "$PORT" \
@@ -87,13 +101,15 @@ for ((i=0; i<NUM_SERVERS; i++)); do
         --enable-metrics \
         --random-seed 42 \
         --chunked-prefill-size -1 \
-        --enable-deterministic-inference 2 \
+        --llm-42-window-size "$STEP_SIZE" \
+        --enable-llm-42 3 \
+        --llm-42-verify-batch-size 1 \
         > "$LOG_FILE" 2>&1 &
     
     SERVER_PID=$!
     PIDS+=($SERVER_PID)
     
-    echo "  → Server $i started with PID $SERVER_PID (GPUs $GPU_IDS, port $PORT)"
+    echo "  → Server started with PID $SERVER_PID on GPU $GPU_ID (port $PORT, step_size=$STEP_SIZE)"
     
     # Small delay between launches to avoid race conditions
     sleep 2
@@ -101,15 +117,16 @@ done
 
 echo ""
 echo "=============================================="
-echo "$NUM_SERVERS server(s) launched successfully!"
+echo "All $NUM_SERVERS servers launched successfully!"
 echo "=============================================="
-echo "Server URL(s):"
+echo "Server URLs and Step Sizes:"
 for ((i=0; i<NUM_SERVERS; i++)); do
     PORT=$((BASE_PORT + i))
-    echo "  Server $i: http://$HOST:$PORT"
+    STEP_SIZE=${STEP_SIZE_ARRAY[$i]}
+    echo "  GPU $i: http://$HOST:$PORT (step_size=$STEP_SIZE)"
 done
 echo ""
-echo "To use with run_compare_mismatches_multi_qps.sh:"
+echo "To use with run_compare_mismatches_multi_step_size.sh:"
 URLS=""
 for ((i=0; i<NUM_SERVERS; i++)); do
     PORT=$((BASE_PORT + i))
@@ -119,16 +136,10 @@ for ((i=0; i<NUM_SERVERS; i++)); do
         URLS="$URLS,http://127.0.0.1:$PORT"
     fi
 done
-echo "  BASE_URLS=\"$URLS\" ./run_compare_mismatches_multi_qps.sh"
-echo "  (QPS values will be run sequentially on the single server)"
+echo "  ./run_compare_mismatches_multi_step_size.sh"
 echo ""
 echo "Press Ctrl+C to stop all servers..."
 echo "=============================================="
 
 # Wait for all background processes
 wait
-
-
-        # --det-infer-window-size 32 \
-        # --enable-det-infer 3 \
-        # --det-infer-verify-batch-size 32 \

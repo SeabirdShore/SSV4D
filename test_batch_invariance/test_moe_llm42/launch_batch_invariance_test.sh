@@ -6,10 +6,10 @@
 set -e
 
 # Model and server configuration
-MODEL_PATH="${SGLANG_TEST_MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
+MODEL_PATH="${SGLANG_TEST_MODEL:-Qwen/Qwen3-30B-A3B}"
 HOST="${SGLANG_HOST:-0.0.0.0}"
 PORT="${SGLANG_PORT:-30005}"
-TP_SIZE="${SGLANG_TP_SIZE:-1}"
+TP_SIZE="${SGLANG_TP_SIZE:-4}"
 ATTENTION_BACKEND="${SGLANG_ATTENTION_BACKEND:-flashinfer}"
 
 # Determine Python command
@@ -42,11 +42,16 @@ $PYTHON_CMD -m sglang.launch_server \
     --attention-backend "$ATTENTION_BACKEND" \
     --disable-radix-cache \
     --disable-chunked-prefix-cache \
+    --chunked-prefill-size -1 \
     --disable-overlap-schedule \
     --enable-metrics \
-    --random-seed 42 \
-    --disable-cuda-graph \
-    --chunked-prefill-size -1 \
-    --det-infer-window-size 32 \
-    --enable-det-infer 3 \
-    --det-infer-verify-batch-size 1 \
+    --llm-42-window-size 64 \
+    --enable-llm-42 3 \
+    --llm-42-verify-batch-size 1
+    # --enable-selective-determinism 1 \
+    # --enable-deterministic-inference 2 \
+    # --llm-42-window-size 10 \
+    # --enable-llm-42 1
+    # --enable-selective-determinism 1 \
+    # --enable-deterministic-inference 1 \
+    # --disable-cuda-graph \
