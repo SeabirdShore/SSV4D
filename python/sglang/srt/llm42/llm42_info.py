@@ -106,6 +106,7 @@ class LLM42Info:
         always_align: bool = True,
         force_include_all: bool = False,
         window_size: Optional[int] = None,
+        output_limits: Optional[dict] = None,
     ) -> LLM42Info:
         """
         Create LLM42Info from a list of finished deterministic requests.
@@ -116,6 +117,8 @@ class LLM42Info:
             force_include_all: If True, include and pad all requests regardless of finished status.
                               Used for fixed-size batches where we need to include not-yet-ready requests.
             window_size: Verification window size for padding. If None, no padding is applied.
+            output_limits: Optional per-request maximum number of unverified tokens
+                           to replay. Used by adaptive-window verification.
             
         Returns:
             LLM42Info instance
@@ -129,6 +132,10 @@ class LLM42Info:
         for req in reqs:
             unverified_output_ids = req.output_ids[req.llm42_verified_tokens:]
             actual_len = len(unverified_output_ids)
+
+            if output_limits is not None and req.rid in output_limits:
+                actual_len = min(actual_len, int(output_limits[req.rid]))
+                unverified_output_ids = unverified_output_ids[:actual_len]
             
             # Skip requests with no unverified tokens
             if actual_len == 0:

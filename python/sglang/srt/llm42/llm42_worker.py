@@ -20,6 +20,7 @@ See §4 of the LLM-42 paper (arXiv:2601.17768) for design details.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -33,6 +34,35 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_verification_windows(default_window: int) -> tuple[int, ...]:
+    """Return fixed verification windows enabled by the SSV4D runtime."""
+
+    raw = os.environ.get("SSV4D_VERIFY_WINDOW_SIZES", "")
+    if not raw:
+        return (default_window,)
+
+    windows = set()
+    for part in raw.split(","):
+        try:
+            window = int(part.strip())
+        except ValueError:
+            continue
+        if 0 < window <= default_window:
+            windows.add(window)
+    windows.add(default_window)
+    configured = tuple(sorted(windows))
+    mode = int(os.environ.get("SGLANG_ENABLE_LLM42", "0") or "0")
+    if len(configured) > 1 and mode == 3:
+        logger.warning(
+            "SSV4D_VERIFY_WINDOW_SIZES requires LLM-42 mode 1 or 2. "
+            "Mode 3 verification is only deterministic within one fixed shape; "
+            "falling back to window_size=%s.",
+            default_window,
+        )
+        return (default_window,)
+    return configured
 
 
 class FixedSizeVerificationPool:
@@ -327,6 +357,9 @@ class LLM42Worker:
         # Initialize fixed-size verification pool if allocators are provided
         # (they may be None here, in which case init_fixed_pool() will be called later)
         self.fixed_pool: Optional[FixedSizeVerificationPool] = None
+        self.fixed_pools: dict[int, FixedSizeVerificationPool] = {}
+        self._multi_shape_verify = False
+        self.tree_verification_pool = None
         self._window_size = window_size
 
         # Instrumentation: count decode steps vs verification forward passes
@@ -355,19 +388,44 @@ class LLM42Worker:
         Can be called during __init__ or later via init_fixed_pool() if
         allocators weren't available at construction time.
         """
+        pools = {}
         try:
-            self.fixed_pool = FixedSizeVerificationPool(
-                fixed_size=self.fixed_requests_per_verify,
-                window_size=self._window_size,
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-                device=device,
-            )
+            for window in _configured_verification_windows(self._window_size):
+                pools[window] = FixedSizeVerificationPool(
+                    fixed_size=self.fixed_requests_per_verify,
+                    window_size=window,
+                    req_to_token_pool=req_to_token_pool,
+                    token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                    device=device,
+                )
+            self.fixed_pools = pools
+            self.fixed_pool = pools.get(self._window_size) or pools[max(pools)]
+            self._multi_shape_verify = len(pools) > 1
+            if os.environ.get("SSV4D_TRIE_VERIFY_ENABLE") == "1":
+                from ssv4d.trie_runtime import TreeVerificationPool
+
+                self.tree_verification_pool = TreeVerificationPool(
+                    fixed_size=self.fixed_requests_per_verify,
+                    node_capacity=int(
+                        os.environ.get("SSV4D_TRIE_NODE_CAPACITY", "128")
+                    ),
+                    req_to_token_pool=req_to_token_pool,
+                    token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                    device=device,
+                )
             logger.info(
                 f"Fixed-size verification enabled: batch_size={self.fixed_requests_per_verify}, "
-                f"window_size={self._window_size}"
+                f"window_size={self._window_size}, "
+                f"verification_windows={tuple(sorted(pools))}, "
+                f"multi_shape={self._multi_shape_verify}, "
+                f"trie_pool={self.tree_verification_pool is not None}"
             )
         except Exception as e:
+            for pool in pools.values():
+                pool.free(token_to_kv_pool_allocator)
+            self.fixed_pool = None
+            self.fixed_pools = {}
+            self._multi_shape_verify = False
             logger.warning(
                 f"Failed to initialize fixed-size verification pool: {e}. "
                 f"Falling back to variable-size batches."
@@ -397,6 +455,25 @@ class LLM42Worker:
         
         self._window_size = window_size
         self._init_fixed_pool(req_to_token_pool, token_to_kv_pool_allocator, device)
+
+    def _requested_verify_tokens(self, req: "Req") -> int:
+        requested = getattr(req, "ssv4d_verify_tokens", None)
+        if requested is None:
+            return self._window_size
+        return max(1, min(int(requested), self._window_size))
+
+    def _fixed_pool_for_request(
+        self, req: "Req"
+    ) -> Optional[FixedSizeVerificationPool]:
+        """Select the smallest fixed shape that can hold this verification."""
+
+        if not self.fixed_pools:
+            return self.fixed_pool
+        requested = self._requested_verify_tokens(req)
+        for window in sorted(self.fixed_pools):
+            if window >= requested:
+                return self.fixed_pools[window]
+        return self.fixed_pools[max(self.fixed_pools)]
 
     def forward_batch_generation(
         self,
@@ -446,7 +523,7 @@ class LLM42Worker:
         # Collect all deterministic requests and identify which ones need verification
         all_det_reqs = []
         at_least_one_ready = False
-        
+
         for req in batch.reqs:
             if not req.is_deterministic:
                 continue
@@ -469,7 +546,7 @@ class LLM42Worker:
             
             # Check if this request triggers verification
             is_finished = req.finished_reason is not None
-            if is_finished or unverified_tokens >= self._window_size:
+            if is_finished or unverified_tokens >= self._requested_verify_tokens(req):
                 at_least_one_ready = True
         
         if not at_least_one_ready:
@@ -486,12 +563,49 @@ class LLM42Worker:
                 output_len = len(req.output_ids)
                 unverified_tokens = output_len - req.llm42_verified_tokens
                 is_finished = req.finished_reason is not None
-                if is_finished or unverified_tokens >= self._window_size:
+                if is_finished or unverified_tokens >= self._requested_verify_tokens(req):
                     ready_reqs.append(req)
                 else:
                     not_ready_reqs.append(req)
             
             all_rollback_results = []
+
+            if self._multi_shape_verify:
+                by_window = {}
+                for req in ready_reqs:
+                    pool = self._fixed_pool_for_request(req)
+                    by_window.setdefault(pool.window_size, (pool, []))[1].append(req)
+
+                used_not_ready = set()
+                for window in sorted(by_window):
+                    pool, window_reqs = by_window[window]
+                    for start in range(0, len(window_reqs), fixed_size):
+                        batch_reqs = list(
+                            window_reqs[start : start + fixed_size]
+                        )
+                        if len(batch_reqs) < fixed_size:
+                            for req in not_ready_reqs:
+                                if req.rid in used_not_ready:
+                                    continue
+                                unverified = (
+                                    len(req.output_ids)
+                                    - req.llm42_verified_tokens
+                                )
+                                if 0 < unverified <= window:
+                                    batch_reqs.append(req)
+                                    used_not_ready.add(req.rid)
+                                if len(batch_reqs) == fixed_size:
+                                    break
+                        num_dummies = fixed_size - len(batch_reqs)
+                        all_rollback_results.extend(
+                            self._verify_fixed_batch(
+                                batch,
+                                batch_reqs,
+                                num_dummies,
+                                verification_pool=pool,
+                            )
+                        )
+                return all_rollback_results
             
             # Process all ready requests in batches of exactly fixed_size
             # Each batch: ready requests first, then not-ready to fill, then dummies
@@ -525,7 +639,7 @@ class LLM42Worker:
             output_len = len(req.output_ids)
             unverified_tokens = output_len - req.llm42_verified_tokens
             is_finished = req.finished_reason is not None
-            if is_finished or unverified_tokens >= self._window_size:
+            if is_finished or unverified_tokens >= self._requested_verify_tokens(req):
                 reqs_to_verify.append(req)
         
         if reqs_to_verify:
@@ -539,17 +653,22 @@ class LLM42Worker:
         original_batch: Union[ScheduleBatch, ModelWorkerBatch],
         real_reqs: List[Req],
         num_dummies: int,
+        verification_pool: Optional[FixedSizeVerificationPool] = None,
     ) -> List[Tuple[Req, int]]:
         """Verify a fixed-size batch (real requests + dummy padding).
 
         Thin wrapper around :meth:`_run_verification` that adds dummy entries
         from the pre-allocated :class:`FixedSizeVerificationPool`.
         """
+        active_pool = verification_pool or self.fixed_pool
+        for req in real_reqs:
+            req.ssv4d_verify_shape = active_pool.window_size
         return self._run_verification(
             original_batch,
             real_reqs,
             force_include_all=True,
             num_dummies=num_dummies,
+            verification_pool=active_pool,
         )
 
     def _verify_deterministic_requests_batched(
@@ -580,6 +699,7 @@ class LLM42Worker:
         reqs: List[Req],
         force_include_all: bool = False,
         num_dummies: int = 0,
+        verification_pool: Optional[FixedSizeVerificationPool] = None,
     ) -> List[Tuple[Req, int]]:
         """Run the full verify-and-rollback pipeline for a single batch.
 
@@ -599,23 +719,34 @@ class LLM42Worker:
             List of ``(req, tokens_rolled_back)`` for requests that were
             rolled back.
         """
+        active_pool = verification_pool or self.fixed_pool
+        verification_window = (
+            active_pool.window_size
+            if active_pool is not None
+            else self._window_size
+        )
         try:
             # 1. Build verification metadata
             llm42_info = LLM42Info.from_requests(
                 reqs,
                 always_align=self.always_align,
                 force_include_all=force_include_all,
-                window_size=self._window_size,
+                window_size=verification_window,
+                output_limits={
+                    req.rid: req.ssv4d_verify_tokens
+                    for req in reqs
+                    if getattr(req, "ssv4d_verify_tokens", None) is not None
+                },
             )
 
             if num_dummies > 0:
-                llm42_info.append_dummy_entries(num_dummies, self.fixed_pool.window_size)
+                llm42_info.append_dummy_entries(num_dummies, verification_window)
 
             # 2. Assign pre-allocated padding KV cache slots (or allocate on the fly
             #    for the variable-size path which has no fixed_pool)
             if llm42_info.total_padding_cache_slots > 0:
-                if self.fixed_pool is not None:
-                    padding_locs = self.fixed_pool.get_padding_cache_locs(
+                if active_pool is not None:
+                    padding_locs = active_pool.get_padding_cache_locs(
                         llm42_info.total_padding_cache_slots
                     )
                     llm42_info.set_padding_cache_locs(padding_locs)
@@ -635,9 +766,9 @@ class LLM42Worker:
             # 3. Build the verification ScheduleBatch
             if num_dummies > 0:
                 dummy_input_ids, dummy_cache_locs, dummy_req_pool_indices = (
-                    self.fixed_pool.get_dummy_data(num_dummies)
+                    active_pool.get_dummy_data(num_dummies)
                 )
-                dummy_sampling_tuple = self.fixed_pool.get_dummy_sampling_tensors(num_dummies)
+                dummy_sampling_tuple = active_pool.get_dummy_sampling_tensors(num_dummies)
                 verify_batch = llm42_info.prepare_verify_batch(
                     original_batch,
                     reqs,
@@ -645,7 +776,7 @@ class LLM42Worker:
                     dummy_cache_locs=dummy_cache_locs,
                     dummy_req_pool_indices=dummy_req_pool_indices,
                     num_dummies=num_dummies,
-                    window_size=self.fixed_pool.window_size,
+                    window_size=verification_window,
                     dummy_sampling_tuple=dummy_sampling_tuple,
                 )
             else:
@@ -705,7 +836,7 @@ class LLM42Worker:
 
             # 8. Free temporary KV cache for padding (only for variable-size path;
             #    fixed_pool padding is pre-allocated and reused)
-            if llm42_info.total_padding_cache_slots > 0 and self.fixed_pool is None:
+            if llm42_info.total_padding_cache_slots > 0 and active_pool is None:
                 llm42_info.free_padding_kv_cache(
                     original_batch.token_to_kv_pool_allocator
                 )
@@ -713,7 +844,11 @@ class LLM42Worker:
             return rollback_results
 
         except Exception as e:
-            if 'llm42_info' in locals() and llm42_info.total_padding_cache_slots > 0 and self.fixed_pool is None:
+            if (
+                'llm42_info' in locals()
+                and llm42_info.total_padding_cache_slots > 0
+                and active_pool is None
+            ):
                 try:
                     llm42_info.free_padding_kv_cache(
                         original_batch.token_to_kv_pool_allocator
@@ -791,3 +926,9 @@ class LLM42Worker:
     def __getattr__(self, name):
         """Delegate unknown attributes to ``target_worker`` (transparent proxy)."""
         return getattr(self.target_worker, name)
+
+
+if os.environ.get("SSV4D_RUNTIME_ENABLE") == "1":
+    from ssv4d.runtime import install_runtime
+
+    install_runtime()

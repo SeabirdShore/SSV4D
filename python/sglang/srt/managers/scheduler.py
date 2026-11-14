@@ -396,11 +396,22 @@ class Scheduler(
                 )
                 # Track reserved slots for memory leak check
                 if self.model_worker.fixed_pool is not None:
-                    reserved = len(self.model_worker.fixed_pool.dummy_cache_locs)
-                    if self.model_worker.fixed_pool._padding_cache_pool_allocated is not None:
-                        reserved += len(self.model_worker.fixed_pool._padding_cache_pool_allocated)
+                    pools = list(self.model_worker.fixed_pools.values())
+                    if not pools:
+                        pools = [self.model_worker.fixed_pool]
+                    reserved = 0
+                    for pool in pools:
+                        reserved += len(pool.dummy_cache_locs)
+                        if pool._padding_cache_pool_allocated is not None:
+                            reserved += len(pool._padding_cache_pool_allocated)
                     self.reserved_kv_slots = reserved
-                    self.reserved_req_pool_slots = self.model_worker.fixed_pool.fixed_size
+                    self.reserved_req_pool_slots = sum(
+                        pool.fixed_size for pool in pools
+                    )
+                    tree_pool = self.model_worker.tree_verification_pool
+                    if tree_pool is not None:
+                        self.reserved_kv_slots += len(tree_pool.cache_locs)
+                        self.reserved_req_pool_slots += tree_pool.fixed_size
 
         # Init running status
         self.init_running_status()

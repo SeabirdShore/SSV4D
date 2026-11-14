@@ -618,6 +618,74 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
+        elif (
+            forward_batch.forward_mode.is_target_llm42_verify()
+            and getattr(
+                forward_batch.spec_info, "is_ssv4d_trie_spec", False
+            )
+        ):
+            spec_info = forward_batch.spec_info
+            if (
+                spec_info.tree_page_table is None
+                or spec_info.tree_cache_seqlens is None
+            ):
+                raise ValueError(
+                    "SSV4D trie spec requires set_kv_layout() before forward"
+                )
+            if batch_size != 1:
+                raise ValueError(
+                    "SSV4D trie FA3 metadata currently supports batch size 1"
+                )
+
+            prefix_page_table = (
+                forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices,
+                    : spec_info.prefix_len,
+                ]
+            )
+            metadata.cache_seqlens_int32 = torch.tensor(
+                [spec_info.prefix_len],
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.max_seq_len_q = spec_info.num_tokens_per_req
+            metadata.max_seq_len_k = spec_info.prefix_len
+            metadata.cu_seqlens_q = torch.tensor(
+                [0, spec_info.num_tokens_per_req],
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.cu_seqlens_k = torch.tensor(
+                [0, spec_info.prefix_len],
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.page_table = prefix_page_table
+
+            metadata_expand = FlashAttentionMetadata()
+            metadata_expand.max_seq_len_q = 1
+            metadata_expand.cache_seqlens_int32 = (
+                spec_info.tree_cache_seqlens.to(torch.int32)
+            )
+            metadata_expand.cu_seqlens_q = torch.arange(
+                0,
+                spec_info.num_tokens_per_req + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(
+                    metadata_expand.cache_seqlens_int32,
+                    dim=0,
+                    dtype=torch.int32,
+                ),
+                (1, 0),
+            )
+            metadata_expand.page_table = spec_info.tree_page_table.to(
+                torch.int32
+            )
+            self.forward_metadata_spec_decode_expand = metadata_expand
+
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
         ):
@@ -809,8 +877,20 @@ class FlashAttentionBackend(AttentionBackend):
         # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
         use_cascade_attn = (
-            forward_batch.forward_mode.is_target_verify()
-            and self.topk > 1
+            (
+                (
+                    forward_batch.forward_mode.is_target_verify()
+                    and self.topk > 1
+                )
+                or (
+                    forward_batch.forward_mode.is_target_llm42_verify()
+                    and getattr(
+                        forward_batch.spec_info,
+                        "is_ssv4d_trie_spec",
+                        False,
+                    )
+                )
+            )
             and not is_swa_layer
         )
 
